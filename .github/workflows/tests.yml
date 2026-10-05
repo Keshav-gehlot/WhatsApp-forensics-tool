@@ -1,0 +1,52 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.12", "3.13"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: requirements*.txt
+      - name: Install Tk (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y python3-tk xvfb
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+      - name: Static check (undefined names)
+        run: python -m pyflakes main.py ui modules | python -c "import sys; l=[x for x in sys.stdin if 'undefined name' in x]; print(''.join(l)); sys.exit(1 if l else 0)"
+      - name: Unit tests
+        run: python -m pytest tests -q
+      - name: GUI smoke test (Linux, virtual display)
+        if: runner.os == 'Linux'
+        run: |
+          xvfb-run -a python tests/smoke_gui.py
+          xvfb-run -a python tests/smoke_case.py
+
+  build-exe:
+    needs: test
+    runs-on: windows-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements-dev.txt
+      - run: pyinstaller wa_forensicator.spec --noconfirm
+      - uses: actions/upload-artifact@v4
+        with:
+          name: WhatsApp-Forensicator-windows
+          path: dist/WhatsAppForensicator/

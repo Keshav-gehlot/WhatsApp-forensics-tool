@@ -7,7 +7,7 @@ looking for a specific word or phrase rather than browsing chat by chat.
 
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from .db_parser import MIN_TS
 
 
 @dataclass
@@ -54,5 +54,5 @@ def search_messages(chats, keyword: str, case_sensitive: bool = False,
 
     # Most recent first — an investigator searching for a keyword is
     # usually most interested in when it was last said, not first.
-    hits.sort(key=lambda h: h.message.timestamp or datetime.min, reverse=True)
+    hits.sort(key=lambda h: h.message.timestamp or MIN_TS, reverse=True)
     return hits

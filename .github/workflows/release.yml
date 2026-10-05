@@ -1,0 +1,116 @@
+name: release
+
+# Push a tag like v1.0.0 and this builds Setup.exe + a portable zip and
+# attaches both (plus SHA-256 checksums) to a GitHub Release.
+#
+#   git tag v1.0.0
+#   git push origin v1.0.0
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version for a manual test build (e.g. 0.0.1-test). No release is published."
+        required: true
+        default: "0.0.0-test"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements*.txt
+
+      - name: Work out version
+        id: ver
+        shell: pwsh
+        run: |
+          if ("${{ github.ref_type }}" -eq "tag") { $v = "${{ github.ref_name }}".TrimStart('v') }
+          else { $v = "${{ inputs.version }}" }
+          "version=$v" >> $env:GITHUB_OUTPUT
+          Write-Host "Version: $v"
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Unit tests
+        run: python -m pytest tests -q
+
+      - name: Fetch adb + Tesseract
+        shell: pwsh
+        run: ./scripts/fetch_tools.ps1
+
+      - name: Build app (PyInstaller)
+        run: python -m PyInstaller wa_forensicator.spec --noconfirm
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          if (-not (Get-Command iscc -ErrorAction SilentlyContinue) -and
+              -not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) {
+            choco install innosetup -y --no-progress
+          }
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { $iscc = "$env:ProgramFiles\Inno Setup 6\ISCC.exe" }
+          & $iscc "/DAppVersion=${{ steps.ver.outputs.version }}" installer\wa_forensicator.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
+
+      - name: Build portable zip
+        shell: pwsh
+        run: |
+          $v    = "${{ steps.ver.outputs.version }}"
+          $dest = "dist\WhatsAppForensicator"
+          Copy-Item bin\platform-tools "$dest\bin\platform-tools" -Recurse -Force
+          Copy-Item bin\tesseract      "$dest\bin\tesseract"      -Recurse -Force
+          if (Test-Path models) { Copy-Item models "$dest\models" -Recurse -Force }
+          Remove-Item "$dest\.ocr_config.json" -ErrorAction SilentlyContinue
+          Copy-Item LICENSE, THIRD_PARTY_NOTICES.md, README.md $dest -Force
+          New-Item -ItemType Directory -Force "$dest\docs" | Out-Null
+          Copy-Item docs\LEGAL_AND_ETHICS.md "$dest\docs" -Force
+          Compress-Archive -Path "$dest\*" -DestinationPath "dist-installer\WhatsAppForensicator-$v-portable.zip" -Force
+
+      - name: Checksums
+        shell: pwsh
+        run: |
+          Get-ChildItem dist-installer -File | ForEach-Object {
+            $h = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
+            "$h  $($_.Name)"
+          } | Out-File -Encoding ascii dist-installer\SHA256SUMS.txt
+          Get-Content dist-installer\SHA256SUMS.txt
+
+      - name: Keep build as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: WhatsAppForensicator-${{ steps.ver.outputs.version }}
+          path: dist-installer/*
+
+      - name: Publish GitHub Release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist-installer/*
+          generate_release_notes: true
+          body: |
+            ## Install
+            - **Setup.exe**: double-click, installs per-user (no admin needed), adds a Start Menu entry.
+            - **Portable .zip**: unzip anywhere and run `WhatsAppForensicator.exe`.
+
+            Both include `adb` and Tesseract OCR. Verify downloads against `SHA256SUMS.txt`.
+
+            The binaries are not code-signed, so Windows SmartScreen may show "Windows protected your PC": choose **More info → Run anyway**.
+
+            For lawful, authorized device examinations only. Read `docs/LEGAL_AND_ETHICS.md`.

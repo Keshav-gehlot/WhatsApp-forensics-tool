@@ -13,26 +13,51 @@ Renders parsed chats/calls to court-referenceable formats:
 
 import os
 import html
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from openpyxl import Workbook
 
-from .db_parser import Chat, CallRecord
+from .db_parser import Chat, CallRecord, MIN_TS, fmt_ts
+from . import custody
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 VIDEO_EXTS = {".mp4", ".3gp", ".mov", ".mkv"}
 AUDIO_EXTS = {".opus", ".mp3", ".m4a", ".aac", ".wav"}
 
 
+def _append_safe(ws, row):
+    """Append a row while neutralising spreadsheet formula injection.
+    openpyxl turns any string starting with '=' into a FORMULA cell, and
+    message text is attacker-controlled. After appending, force those
+    cells back to plain-text type so the content is preserved verbatim
+    and never evaluated."""
+    ws.append(list(row))
+    for cell in ws[ws.max_row]:
+        if isinstance(cell.value, str) and cell.value.startswith("="):
+            cell.data_type = "s"
+
+
+def _unique_name(base: str, ext: str, used: set) -> str:
+    """Return a file name that has not been used in this export run, so two
+    chats with the same display name don't overwrite each other."""
+    name = f"{base}{ext}"
+    n = 2
+    while name.lower() in used:
+        name = f"{base}_{n}{ext}"
+        n += 1
+    used.add(name.lower())
+    return name
+
+
 def export_chat_txt(chat: Chat, output_path: str):
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(f"Chat with: {chat.display_name} ({chat.jid})\n")
-        f.write(f"Exported: {datetime.now().isoformat()}\n")
+        f.write(f"Exported: {datetime.now(timezone.utc).isoformat(timespec='seconds')} (all message times are UTC)\n")
         f.write("=" * 60 + "\n\n")
         for m in chat.messages:
             who = "Me" if m.from_me else chat.display_name
-            ts = m.timestamp.strftime("%Y-%m-%d %H:%M:%S") if m.timestamp else "unknown time"
+            ts = fmt_ts(m.timestamp, seconds=True)
             f.write(f"[{ts}] {who}: {m.text}\n")
 
 
@@ -40,15 +65,16 @@ def export_chats_xlsx(chats: list[Chat], output_path: str):
     wb = Workbook()
     ws = wb.active
     ws.title = "Messages"
-    ws.append(["Chat", "From", "Message", "Timestamp", "Media Type"])
+    ws.append(["Chat", "From", "Message", "Timestamp (UTC)", "Media Type", "Deleted for everyone"])
     for chat in chats:
         for m in chat.messages:
-            ws.append([
+            _append_safe(ws, [
                 chat.display_name,
                 "Me" if m.from_me else chat.display_name,
                 m.text,
                 m.timestamp.isoformat() if m.timestamp else "",
                 m.media_type or "",
+                "Yes" if m.is_deleted else "",
             ])
     wb.save(output_path)
 
@@ -57,14 +83,15 @@ def export_calls_xlsx(calls: list[CallRecord], output_path: str):
     wb = Workbook()
     ws = wb.active
     ws.title = "Call Log"
-    ws.append(["Contact/Number", "Type", "Video", "Duration (s)", "Timestamp"])
+    ws.append(["Contact/Number", "Type", "Video", "Duration (s)", "Timestamp (UTC)", "Raw result code"])
     for c in calls:
-        ws.append([
+        _append_safe(ws, [
             c.phone_number,
             c.call_type,
             "Yes" if c.is_video else "No",
             c.duration_seconds,
             c.timestamp.isoformat() if c.timestamp else "",
+            c.result_code if c.result_code is not None else "",
         ])
     wb.save(output_path)
 
@@ -102,7 +129,7 @@ _BUBBLE_TEMPLATE = """<div class="bubble {cls}">{text}<div class="meta">{ts}</di
 _CALL_MARKER_TEMPLATE = """<div class="call-marker"><span>{icon} {label}{duration}</span><div class="meta">{ts}</div></div>"""
 
 
-def _media_snippet(local_path, relative_path) -> str:
+def _media_snippet(local_path, relative_path, base_dir=None) -> str:
     """Embed the actual file if we resolved a local copy of it; otherwise
     say plainly that the reference exists but wasn't recovered locally."""
     if not relative_path:
@@ -110,7 +137,16 @@ def _media_snippet(local_path, relative_path) -> str:
     if not local_path:
         return (f'<div class="media-missing">📎 media referenced '
                  f'({html.escape(os.path.basename(relative_path))}) — not recovered locally</div>')
-    uri = Path(local_path).resolve().as_uri()
+    # Prefer a path relative to the report so the export folder can be
+    # moved/zipped together with its media; fall back to an absolute
+    # file:// URI (e.g. media on a different drive).
+    resolved = Path(local_path).resolve()
+    uri = resolved.as_uri()
+    if base_dir:
+        try:
+            uri = Path(os.path.relpath(resolved, base_dir)).as_posix().replace(" ", "%20")
+        except ValueError:
+            pass
     ext = os.path.splitext(local_path)[1].lower()
     if ext in IMAGE_EXTS:
         return f'<img src="{uri}" alt="media">'
@@ -130,7 +166,7 @@ def _call_marker(call: CallRecord) -> str:
     duration = ""
     if call.duration_seconds:
         duration = f" · {call.duration_seconds // 60}:{call.duration_seconds % 60:02d}"
-    ts = call.timestamp.strftime("%Y-%m-%d %H:%M") if call.timestamp else ""
+    ts = fmt_ts(call.timestamp, empty="")
     return _CALL_MARKER_TEMPLATE.format(icon=icon, label=label, duration=duration, ts=ts)
 
 
@@ -138,10 +174,10 @@ def export_chat_html(chat: Chat, output_path: str, media_index=None):
     rows = []
     for m in chat.messages:
         cls = "me" if m.from_me else "them"
-        ts = m.timestamp.strftime("%Y-%m-%d %H:%M") if m.timestamp else ""
+        ts = fmt_ts(m.timestamp, empty="")
         text_html = html.escape(m.text).replace("\n", "<br>") if m.text else ""
         local_path = media_index.resolve(m.media_relative_path) if media_index else None
-        media_html = _media_snippet(local_path, m.media_relative_path)
+        media_html = _media_snippet(local_path, m.media_relative_path, os.path.dirname(os.path.abspath(output_path)))
         rows.append(_BUBBLE_TEMPLATE.format(cls=cls, text=text_html + media_html, ts=ts))
     page = _HTML_TEMPLATE.format(
         chat_name=html.escape(chat.display_name),
@@ -164,9 +200,9 @@ def export_reconstructed_chat(chat: Chat, calls: list[CallRecord], output_path: 
 
     events = []
     for m in chat.messages:
-        events.append((m.timestamp or datetime.min, "message", m))
+        events.append((m.timestamp or MIN_TS, "message", m))
     for c in calls_for_chat:
-        events.append((c.timestamp or datetime.min, "call", c))
+        events.append((c.timestamp or MIN_TS, "call", c))
     events.sort(key=lambda e: e[0])
 
     rows = []
@@ -174,10 +210,10 @@ def export_reconstructed_chat(chat: Chat, calls: list[CallRecord], output_path: 
         if kind == "message":
             m = payload
             cls = "me" if m.from_me else "them"
-            ts_str = m.timestamp.strftime("%Y-%m-%d %H:%M") if m.timestamp else ""
+            ts_str = fmt_ts(m.timestamp, empty="")
             text_html = html.escape(m.text).replace("\n", "<br>") if m.text else ""
             local_path = media_index.resolve(m.media_relative_path) if media_index else None
-            media_html = _media_snippet(local_path, m.media_relative_path)
+            media_html = _media_snippet(local_path, m.media_relative_path, os.path.dirname(os.path.abspath(output_path)))
             rows.append(_BUBBLE_TEMPLATE.format(cls=cls, text=text_html + media_html, ts=ts_str))
         else:
             rows.append(_call_marker(payload))
@@ -191,6 +227,39 @@ def export_reconstructed_chat(chat: Chat, calls: list[CallRecord], output_path: 
         f.write(page)
 
 
+def export_extras_xlsx(db, output_path: str) -> int:
+    """One workbook with reactions, edits, group participants, starred
+    messages and status updates read from the open WaDatabase. Returns the
+    total number of rows written."""
+    wb = Workbook()
+    wb.remove(wb.active)
+    total = 0
+
+    def sheet(name, header, rows):
+        nonlocal total
+        ws = wb.create_sheet(name)
+        ws.append(header)
+        for r in rows:
+            _append_safe(ws, r)
+        total += len(rows)
+
+    sheet("Reactions", ["Chat", "Reactor", "Emoji", "On message", "Time (UTC)"],
+          [[r.chat_jid, r.reactor_jid, r.emoji, r.target_text, r.timestamp.isoformat() if r.timestamp else ""]
+           for r in db.get_reactions()])
+    sheet("Edits", ["Chat", "Current text", "Edited (UTC)", "Originally sent (UTC)"],
+          [[e.chat_jid, e.current_text, e.edited_at.isoformat() if e.edited_at else "",
+            e.original_sent_at.isoformat() if e.original_sent_at else ""] for e in db.get_edits()])
+    sheet("Group participants", ["Group", "Group name", "Member", "Role"],
+          [[p.group_jid, p.group_name, p.member_jid, p.role] for p in db.get_group_participants()])
+    sheet("Starred", ["Chat", "Text", "Time (UTC)"],
+          [[m.chat_jid, m.text, m.timestamp.isoformat() if m.timestamp else ""] for m in db.get_starred()])
+    sheet("Status updates", ["From me", "Text", "Media", "Time (UTC)"],
+          [["Yes" if m.from_me else "No", m.text, m.media_relative_path or "",
+            m.timestamp.isoformat() if m.timestamp else ""] for m in db.get_status_updates()])
+    wb.save(output_path)
+    return total
+
+
 def export_all(chats: list[Chat], calls: list[CallRecord], output_dir: str,
                formats: list[str], media_index=None):
     """
@@ -202,18 +271,21 @@ def export_all(chats: list[Chat], calls: list[CallRecord], output_dir: str,
     os.makedirs(output_dir, exist_ok=True)
     written = {fmt: [] for fmt in formats}
 
+    used_names: set = set()
     for chat in chats:
-        safe_name = "".join(c for c in chat.display_name if c.isalnum() or c in " _-")[:50] or "chat"
+        base = "".join(c for c in chat.display_name if c.isalnum() or c in " _-")[:50] or "chat"
+        # one stem per chat, shared by all its formats, unique across chats
+        stem = _unique_name(base, "", used_names)
         if "txt" in formats:
-            p = os.path.join(output_dir, f"{safe_name}.txt")
+            p = os.path.join(output_dir, f"{stem}.txt")
             export_chat_txt(chat, p)
             written["txt"].append(p)
         if "html" in formats:
-            p = os.path.join(output_dir, f"{safe_name}.html")
+            p = os.path.join(output_dir, f"{stem}.html")
             export_chat_html(chat, p, media_index=media_index)
             written["html"].append(p)
         if "reconstruct" in formats:
-            p = os.path.join(output_dir, f"{safe_name}.reconstructed.html")
+            p = os.path.join(output_dir, f"{stem}.reconstructed.html")
             export_reconstructed_chat(chat, calls, p, media_index=media_index)
             written["reconstruct"].append(p)
 
@@ -227,4 +299,9 @@ def export_all(chats: list[Chat], calls: list[CallRecord], output_dir: str,
         export_calls_xlsx(calls, p)
         written["calls_xlsx"].append(p)
 
+    # Chain of custody: hash and log every file written.
+    for fmt, paths in written.items():
+        for p in paths:
+            custody.record(output_dir, f"export-{fmt}", p)
+    custody.write_case_report(output_dir)
     return written

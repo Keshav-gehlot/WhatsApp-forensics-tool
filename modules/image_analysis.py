@@ -126,8 +126,100 @@ def scan_for_faces(image_paths: list[str], progress: Optional[Callable[[str], No
 @dataclass
 class PersonMatch:
     image_path: str
-    confidence: float   # LBPH distance — LOWER means a closer match
+    confidence: float   # meaning depends on `method` — see describe_score()
     bounding_box: tuple
+    method: str = "lbph"   # "lbph" (distance, lower=closer) | "sface" (cosine similarity, higher=closer)
+
+    def describe_score(self) -> str:
+        if self.method == "sface":
+            return f"similarity {self.confidence:.2f} (SFace)"
+        return f"distance {self.confidence:.1f} (LBPH)"
+
+
+MATCH_DISCLAIMER = ("Face matches are investigative LEADS, not identifications. "
+                    "Always verify manually before relying on one.")
+
+# Optional modern pipeline: OpenCV's YuNet detector + SFace embedding model.
+# Both are small ONNX files (~40 MB total) that are NOT bundled — put them in
+# the models/ folder (see models/README.md). Without them the tool falls
+# back to LBPH and says so.
+from .paths import app_root
+
+MODELS_DIR = os.path.join(app_root(), "models")
+YUNET_FILE = "face_detection_yunet_2023mar.onnx"
+SFACE_FILE = "face_recognition_sface_2021dec.onnx"
+SFACE_COSINE_THRESHOLD = 0.363   # OpenCV's documented same-person cosine cutoff
+
+
+def modern_models_available(models_dir: Optional[str] = None) -> bool:
+    d = models_dir or MODELS_DIR
+    return (os.path.isfile(os.path.join(d, YUNET_FILE)) and os.path.isfile(os.path.join(d, SFACE_FILE))
+            and hasattr(cv2, "FaceDetectorYN") and hasattr(cv2, "FaceRecognizerSF"))
+
+
+class EmbeddingPersonMatcher:
+    """YuNet + SFace face-embedding matcher (fully local). Same interface as
+    PersonMatcher. Much more robust to pose/lighting/age than LBPH, but
+    still not an identification — see MATCH_DISCLAIMER."""
+
+    def __init__(self, models_dir: Optional[str] = None):
+        d = models_dir or MODELS_DIR
+        self._detector = cv2.FaceDetectorYN.create(os.path.join(d, YUNET_FILE), "", (320, 320), 0.8)
+        self._recognizer = cv2.FaceRecognizerSF.create(os.path.join(d, SFACE_FILE), "")
+        self._refs = []
+
+    def _faces(self, path):
+        img = cv2.imread(path)
+        if img is None:
+            return None, []
+        h, w = img.shape[:2]
+        self._detector.setInputSize((w, h))
+        _, faces = self._detector.detect(img)
+        return img, ([] if faces is None else list(faces))
+
+    def _embed(self, img, face):
+        return self._recognizer.feature(self._recognizer.alignCrop(img, face))
+
+    def train(self, reference_image_paths: list[str]) -> int:
+        self._refs = []
+        for path in reference_image_paths:
+            img, faces = self._faces(path)
+            if faces:
+                best = max(faces, key=lambda f: f[2] * f[3])
+                self._refs.append(self._embed(img, best))
+        if not self._refs:
+            raise ValueError("No face could be detected in any of the reference images. "
+                             "Use a clearer, more front-facing reference photo.")
+        return len(self._refs)
+
+    def match(self, candidate_image_paths: list[str], min_similarity: float = SFACE_COSINE_THRESHOLD,
+              progress: Optional[Callable[[str], None]] = None, **_ignored) -> list[PersonMatch]:
+        if not self._refs:
+            raise RuntimeError("Call train() with reference photos before match().")
+        results = []
+        for i, path in enumerate(candidate_image_paths):
+            img, faces = self._faces(path)
+            for f in faces:
+                emb = self._embed(img, f)
+                score = max(self._recognizer.match(r, emb, cv2.FaceRecognizerSF_FR_COSINE) for r in self._refs)
+                if score >= min_similarity:
+                    results.append(PersonMatch(path, float(score),
+                                               tuple(int(v) for v in f[:4]), method="sface"))
+            if progress and i % 20 == 0:
+                progress(f"Checked {i + 1}/{len(candidate_image_paths)} images for person match...")
+        results.sort(key=lambda m: -m.confidence)
+        return results
+
+
+def make_person_matcher(models_dir: Optional[str] = None):
+    """Best available matcher: SFace embeddings if the model files are
+    present, else the classic LBPH matcher. Returns (matcher, method_name)."""
+    if modern_models_available(models_dir):
+        try:
+            return EmbeddingPersonMatcher(models_dir), "sface"
+        except Exception:
+            pass
+    return PersonMatcher(), "lbph"
 
 
 class PersonMatcher:
@@ -187,7 +279,7 @@ class PersonMatcher:
                     _, distance = self._recognizer.predict(face)
                     if distance <= max_distance:
                         results.append(PersonMatch(image_path=path, confidence=distance,
-                                                    bounding_box=(x, y, w, h)))
+                                                    bounding_box=(x, y, w, h), method="lbph"))
             if progress and i % 20 == 0:
                 progress(f"Checked {i + 1}/{len(candidate_image_paths)} images for person match...")
 

@@ -11,6 +11,7 @@ __pycache__/
 build/
 develop-eggs/
 dist/
+dist-installer/
 downloads/
 eggs/
 .eggs/
@@ -29,6 +30,7 @@ MANIFEST
 # PyInstaller / Executables
 *.manifest
 *.spec
+!wa_forensicator.spec
 *.exe
 
 # Installer logs
@@ -87,3 +89,11 @@ decrypted/
 *.crypt12
 *.crypt14
 *.crypt15
+
+# Optional face models are downloaded separately
+models/*.onnx
+
+# Local build logs / duplicate workflow copy
+*_log.txt
+iscc_err.txt
+Claude outputs/

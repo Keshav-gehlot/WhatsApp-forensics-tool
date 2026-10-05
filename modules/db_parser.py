@@ -13,8 +13,35 @@ present and adapts, rather than assuming one fixed layout.
 import sqlite3
 import os
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
+
+
+UTC = timezone.utc
+MIN_TS = datetime.min.replace(tzinfo=UTC)   # sort key for rows with no timestamp
+
+# message_type value WhatsApp uses for "message deleted for everyone"
+# (revoked). Heuristic from observed schemas — verify on your samples.
+REVOKED_MESSAGE_TYPE = 15
+
+
+def fmt_ts(dt, seconds=False, empty="unknown time"):
+    """Format an aware-UTC datetime for display/export, always labelled."""
+    if not dt:
+        return empty
+    return dt.strftime("%Y-%m-%d %H:%M:%S UTC" if seconds else "%Y-%m-%d %H:%M UTC")
+
+
+def ms_to_utc(ms):
+    """Epoch milliseconds -> timezone-aware UTC datetime (None if empty).
+    All timestamps in this tool are UTC so exports are reproducible
+    regardless of the examiner's machine timezone."""
+    if not ms:
+        return None
+    try:
+        return datetime.fromtimestamp(ms / 1000.0, tz=UTC)
+    except (OverflowError, OSError, ValueError):
+        return None
 
 
 @dataclass
@@ -28,7 +55,7 @@ class Message:
     media_mime_type: Optional[str] = None
     thumbnail_blob: Optional[bytes] = None      # low-res JPEG stored inline in msgstore.db,
                                                  # independent of whether the full file survives
-    is_deleted: bool = False
+    is_deleted: bool = False                     # deleted-for-everyone marker (see REVOKED_MESSAGE_TYPE)
 
 
 @dataclass
@@ -47,6 +74,35 @@ class CallRecord:
     is_video: bool
     duration_seconds: int
     timestamp: datetime
+    result_code: Optional[int] = None   # raw call_result from the DB when present (meaning varies by version)
+
+
+@dataclass
+class Reaction:
+    chat_jid: str
+    target_text: str          # text of the message that was reacted to (may be empty for media)
+    reactor_jid: str          # "me" when from_me
+    emoji: str
+    timestamp: Optional[datetime]
+
+
+@dataclass
+class EditRecord:
+    chat_jid: str
+    current_text: str
+    edited_at: Optional[datetime]
+    original_sent_at: Optional[datetime]
+
+
+@dataclass
+class Participant:
+    group_jid: str
+    group_name: str
+    member_jid: str
+    role: str                 # "member" | "admin" | "superadmin" | "unknown"
+
+
+STATUS_JID = "status@broadcast"
 
 
 class WaDatabase:
@@ -112,7 +168,10 @@ class WaDatabase:
 
     # -- messages -----------------------------------------------------------
 
-    def get_chats(self, limit: int = 500) -> list[Chat]:
+    def get_chats(self, limit: Optional[int] = None) -> list[Chat]:
+        """Returns ALL chats and messages by default. `limit` (if given)
+        caps the total number of message rows read, oldest first — only
+        pass it for quick previews, never for evidence review/export."""
         chats = {}
         row_id_to_message = {}
 
@@ -125,7 +184,7 @@ class WaDatabase:
                 JOIN chat c ON m.chat_row_id = c._id
                 JOIN jid j ON c.jid_row_id = j._id
                 ORDER BY m.timestamp ASC
-                LIMIT ?
+                {limit_clause}
             """
         else:
             legacy_cols = self._table_columns("messages")
@@ -139,21 +198,26 @@ class WaDatabase:
                        {media_select}{thumb_select}
                 FROM messages
                 ORDER BY timestamp ASC
-                LIMIT ?
+                {{limit_clause}}
             """
 
-        cur = self._conn.execute(query, (limit,))
+        limit_clause = "LIMIT ?" if limit else ""
+        # (the legacy query is an f-string already; both carry the literal
+        # {limit_clause} placeholder, filled here)
+        query = query.replace("{limit_clause}", limit_clause)
+        cur = self._conn.execute(query, (limit,) if limit else ())
         for row in cur.fetchall():
             jid = row["jid"]
             if jid not in chats:
                 chats[jid] = Chat(jid=jid, display_name=self.contact_name(jid))
-            ts = datetime.fromtimestamp(row["timestamp"] / 1000.0) if row["timestamp"] else None
+            ts = ms_to_utc(row["timestamp"])
             msg = Message(
                 chat_jid=jid,
                 from_me=bool(row["from_me"]),
                 text=row["text_data"] or "",
                 timestamp=ts,
                 media_type=str(row["message_type"]) if row["message_type"] else None,
+                is_deleted=(row["message_type"] == REVOKED_MESSAGE_TYPE),
             )
             if self._schema == "legacy":
                 keys = row.keys()
@@ -192,26 +256,53 @@ class WaDatabase:
                         if r[3]:
                             msg.thumbnail_blob = r[3]
 
+        # Thumbnails live in their own `message_thumbnails` table on modern
+        # schemas (keyed by message_row_id) — pick those up too, without
+        # overwriting a blob already found in message_media.
+        if self._schema == "modern" and self._table_exists("message_thumbnails"):
+            tcols = self._table_columns("message_thumbnails")
+            if "thumbnail" in tcols and "message_row_id" in tcols:
+                for r in self._conn.execute(
+                        "SELECT message_row_id, thumbnail FROM message_thumbnails"):
+                    msg = row_id_to_message.get(r[0])
+                    if msg is not None and r[1] and not msg.thumbnail_blob:
+                        msg.thumbnail_blob = r[1]
+
         return list(chats.values())
 
     # -- calls ---------------------------------------------------------------
 
     def get_calls(self) -> list[CallRecord]:
-        if not self._table_exists("call_log"):
-            return []
         if self._schema == "modern":
-            cur = self._conn.execute("""
+            if not self._table_exists("call_log"):
+                return []
+            cols = self._table_columns("call_log")
+            result_sel = "cl.call_result" if "call_result" in cols else "NULL"
+            cur = self._conn.execute(f"""
                 SELECT j.raw_string AS jid, cl.from_me, cl.video_call,
-                       cl.duration, cl.timestamp
+                       cl.duration, cl.timestamp, {result_sel} AS call_result
                 FROM call_log cl
                 JOIN jid j ON cl.jid_row_id = j._id
                 ORDER BY cl.timestamp DESC
             """)
         else:
-            cur = self._conn.execute("""
-                SELECT key_remote_jid AS jid, from_me, video_call,
-                       duration, timestamp
-                FROM call_log_legacy
+            # Legacy layouts used `calls` (older) or a key_remote_jid-style
+            # `call_log`. Use whichever exists with the columns we need.
+            table = None
+            for cand in ("calls", "call_log", "call_log_legacy"):
+                if self._table_exists(cand) and "key_remote_jid" in self._table_columns(cand):
+                    table = cand
+                    break
+            if table is None:
+                return []
+            cols = self._table_columns(table)
+            from_me = "from_me" if "from_me" in cols else ("key_from_me" if "key_from_me" in cols else "0")
+            result_sel = "call_result" if "call_result" in cols else "NULL"
+            cur = self._conn.execute(f"""
+                SELECT key_remote_jid AS jid, {from_me} AS from_me, video_call,
+                       duration, timestamp, {result_sel} AS call_result
+                FROM {table}
+                ORDER BY timestamp DESC
             """)
 
         results = []
@@ -220,21 +311,138 @@ class WaDatabase:
                 jid = row["jid"]
                 from_me = bool(row["from_me"])
                 duration = row["duration"] or 0
-                call_type = "MISSED" if duration == 0 and not from_me else (
-                    "OUT" if from_me else "IN"
-                )
-                ts = datetime.fromtimestamp(row["timestamp"] / 1000.0) if row["timestamp"] else None
+                # Only claim what the data supports: an incoming call with
+                # no talk time is "MISSED" (missed OR rejected — the DB's
+                # raw result_code is kept so an examiner can tell them
+                # apart); an outgoing call with no talk time is
+                # "UNANSWERED".
+                if from_me:
+                    call_type = "OUT" if duration else "UNANSWERED"
+                else:
+                    call_type = "IN" if duration else "MISSED"
                 results.append(CallRecord(
                     contact_jid=jid,
                     phone_number=jid.split("@")[0] if jid else "unknown",
                     call_type=call_type,
                     is_video=bool(row["video_call"]),
                     duration_seconds=duration,
-                    timestamp=ts,
+                    timestamp=ms_to_utc(row["timestamp"]),
+                    result_code=row["call_result"],
                 ))
             except (IndexError, KeyError):
                 continue
         return results
+
+    # -- extras: reactions, edits, participants, starred, status ---------
+    # These tables vary a lot between WhatsApp releases. Each method probes
+    # for the table/columns it needs and returns [] if they are absent, so a
+    # missing table is "nothing found", never a crash. Table/column names
+    # are from observed schemas — validate against your own samples.
+
+    def _jid_map(self) -> dict:
+        if not self._table_exists("jid"):
+            return {}
+        return {r[0]: r[1] for r in self._conn.execute("SELECT _id, raw_string FROM jid")}
+
+    def _message_index(self) -> dict:
+        """message _id -> (chat_jid, text, timestamp_ms) for the modern schema."""
+        if self._schema != "modern":
+            return {}
+        out = {}
+        for r in self._conn.execute(
+                "SELECT m._id, j.raw_string, m.text_data, m.timestamp FROM message m "
+                "JOIN chat c ON m.chat_row_id = c._id JOIN jid j ON c.jid_row_id = j._id"):
+            out[r[0]] = (r[1], r[2] or "", r[3])
+        return out
+
+    def get_reactions(self) -> list[Reaction]:
+        if not (self._table_exists("message_add_on") and self._table_exists("message_add_on_reaction")):
+            return []
+        ao = self._table_columns("message_add_on")
+        parent = next((c for c in ("parent_message_row_id", "message_row_id") if c in ao), None)
+        if not parent or "message_add_on_row_id" not in self._table_columns("message_add_on_reaction"):
+            return []
+        jids, msgs = self._jid_map(), self._message_index()
+        sender = "a.sender_jid_row_id" if "sender_jid_row_id" in ao else "NULL"
+        from_me = "a.from_me" if "from_me" in ao else "0"
+        ts = "a.timestamp" if "timestamp" in ao else "NULL"
+        rows = self._conn.execute(
+            f"SELECT a.{parent}, {sender}, {from_me}, {ts}, r.reaction "
+            "FROM message_add_on a JOIN message_add_on_reaction r ON r.message_add_on_row_id = a._id "
+            "ORDER BY 4").fetchall()
+        out = []
+        for parent_id, sender_id, fm, t, emoji in rows:
+            chat, text, _ = msgs.get(parent_id, ("", "", None))
+            out.append(Reaction(chat_jid=chat, target_text=text,
+                                reactor_jid="me" if fm else jids.get(sender_id, ""),
+                                emoji=emoji or "", timestamp=ms_to_utc(t)))
+        return out
+
+    def get_edits(self) -> list[EditRecord]:
+        if not self._table_exists("message_edit_info"):
+            return []
+        cols = self._table_columns("message_edit_info")
+        if "message_row_id" not in cols:
+            return []
+        msgs = self._message_index()
+        edited = "edited_timestamp" if "edited_timestamp" in cols else "NULL"
+        sent = "sender_timestamp" if "sender_timestamp" in cols else "NULL"
+        out = []
+        for mid, e, snd in self._conn.execute(
+                f"SELECT message_row_id, {edited}, {sent} FROM message_edit_info ORDER BY 2"):
+            chat, text, _ = msgs.get(mid, ("", "", None))
+            out.append(EditRecord(chat_jid=chat, current_text=text,
+                                  edited_at=ms_to_utc(e), original_sent_at=ms_to_utc(snd)))
+        return out
+
+    def get_group_participants(self) -> list[Participant]:
+        roles = {0: "member", 1: "admin", 2: "superadmin"}
+        jids = self._jid_map()
+        out = []
+        if self._table_exists("group_participant_user"):
+            cols = self._table_columns("group_participant_user")
+            if {"group_jid_row_id", "user_jid_row_id"} <= cols:
+                rank = "rank" if "rank" in cols else "NULL"
+                for g, u, rk in self._conn.execute(
+                        f"SELECT group_jid_row_id, user_jid_row_id, {rank} FROM group_participant_user"):
+                    gj = jids.get(g, "")
+                    out.append(Participant(gj, self.contact_name(gj), jids.get(u, ""),
+                                           roles.get(rk, "unknown") if rk is not None else "unknown"))
+        elif self._table_exists("group_participants"):          # legacy
+            cols = self._table_columns("group_participants")
+            if {"gjid", "jid"} <= cols:
+                adm = "admin" if "admin" in cols else "NULL"
+                for g, u, a in self._conn.execute(f"SELECT gjid, jid, {adm} FROM group_participants"):
+                    out.append(Participant(g, self.contact_name(g), u or "",
+                                           {0: "member", 1: "admin", 2: "superadmin"}.get(a, "unknown")))
+        return out
+
+    def get_starred(self) -> list[Message]:
+        """Starred messages (modern: a starred-message table or a `starred`
+        column on `message`; legacy: `messages.starred`)."""
+        if self._schema == "modern":
+            ids = set()
+            for t in ("starred_message", "message_starred"):
+                if self._table_exists(t) and "message_row_id" in self._table_columns(t):
+                    ids |= {r[0] for r in self._conn.execute(f"SELECT message_row_id FROM {t}")}
+            if "starred" in self._table_columns("message"):
+                ids |= {r[0] for r in self._conn.execute("SELECT _id FROM message WHERE starred = 1")}
+            idx = self._message_index()
+            return [Message(chat_jid=idx[i][0], from_me=False, text=idx[i][1],
+                            timestamp=ms_to_utc(idx[i][2])) for i in sorted(ids) if i in idx]
+        if "starred" in self._table_columns("messages"):
+            return [Message(chat_jid=r[0], from_me=bool(r[1]), text=r[2] or "", timestamp=ms_to_utc(r[3]))
+                    for r in self._conn.execute(
+                        "SELECT key_remote_jid, key_from_me, data, timestamp FROM messages WHERE starred = 1")]
+        return []
+
+    def get_status_updates(self) -> list[Message]:
+        """Status (story) posts and views — stored as messages in the
+        `status@broadcast` chat."""
+        for chat in self.get_chats():
+            if chat.jid == STATUS_JID:
+                return chat.messages
+        return []
 
     def close(self):
         self._conn.close()

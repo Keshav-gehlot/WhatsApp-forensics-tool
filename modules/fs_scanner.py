@@ -45,6 +45,11 @@ EXTERNAL_ROOTS = [
     "/sdcard/Android/media/com.whatsapp",
     "/storage/emulated/0/WhatsApp",
     "/storage/emulated/0/Android/media/com.whatsapp",
+    # WhatsApp Business
+    "/sdcard/WhatsApp Business",
+    "/sdcard/Android/media/com.whatsapp.w4b",
+    "/storage/emulated/0/WhatsApp Business",
+    "/storage/emulated/0/Android/media/com.whatsapp.w4b",
 ]
 
 # Common places a user (or another app) might have manually saved/moved a
@@ -161,8 +166,8 @@ class ScanReport:
 def _find(serial: str, root: str, pattern: str, timeout: int = 60) -> list[str]:
     try:
         out = _run(
-            ["-s", serial, "shell", "find", root, "-iname", f"'{pattern}'"],
-            timeout=timeout,
+            ["-s", serial, "shell", "find", f"'{root}'", "-iname", f"'{pattern}'"],
+            timeout=timeout, check=False,
         )
     except AdbError:
         return []
@@ -186,13 +191,13 @@ def _find_multi(serial: str, root: str, patterns: list[str], timeout: int = 90) 
     action (like -exec) needs explicit precedence, which isn't the case
     here.
     """
-    args = ["-s", serial, "shell", "find", root]
+    args = ["-s", serial, "shell", "find", f"'{root}'"]  # quoted: "WhatsApp Business" has a space
     for i, pattern in enumerate(patterns):
         if i > 0:
             args.append("-o")
         args += ["-iname", f"'{pattern}'"]
     try:
-        out = _run(args, timeout=timeout)
+        out = _run(args, timeout=timeout, check=False)
     except AdbError:
         return []
     lines = [l.strip() for l in out.splitlines() if l.strip()]
